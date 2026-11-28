@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified by Tenax Motion, 2026: tests of more registered names than
-// the default.
+// the default, and of views.
 
 #include "mjlib/micro/persistent_config.h"
 
@@ -192,4 +192,220 @@ struct ManyFixture : test::CommandManagerFixture {
 BOOST_FIXTURE_TEST_CASE(PersistentConfigMaxElements, ManyFixture) {
   Command("conf get n19.value\n");
   ExpectResponse("0\r\n");
+}
+
+namespace {
+// A second command manager with a view, as a second axis of one board
+// would have, alongside the first.
+struct ViewFixture : test::CommandManagerFixture {
+  test::StubFlash flash;
+  char output_buffer[4096] = {};
+  PersistentConfig dut{
+    pool, command_manager, flash,
+    mjlib::base::string_span(output_buffer)};
+
+  SizedPool<> pool_b;
+  StreamPipe pipe_b{event_queue.MakePoster()};
+  test::Reader reader_b{pipe_b.side_b()};
+  AsyncExclusive<AsyncWriteStream> write_stream_b{pipe_b.side_a()};
+  CommandManager command_manager_b{
+    &pool_b, pipe_b.side_a(), &write_stream_b};
+  char output_buffer_b[4096] = {};
+
+  // "servo" and "id" are per axis, "board" is shared by both, and
+  // "can" only the first axis has.
+  test::MyData servo;
+  test::MyData servo_b;
+  test::OtherData id;
+  test::OtherData id_b;
+  test::MyData board;
+  test::OtherData hidden_b;
+
+  int servo_count = 0;
+  int servo_b_count = 0;
+  int board_count = 0;
+
+  ViewFixture() {
+    command_manager_b.AsyncStart();
+
+    dut.Register("servo", &servo, [this]() { servo_count++; });
+    dut.Register("id", &id, []() {});
+    dut.Register("board", &board, [this]() { board_count++; });
+    dut.Register("axisb_servo", &servo_b, [this]() { servo_b_count++; });
+    dut.Register("axisb_id", &id_b, []() {});
+    PersistentConfig::RegisterOptions register_options;
+    register_options.enumerate = false;
+    dut.Register("axisb_hidden", &hidden_b, []() {}, register_options);
+
+    dut.AddView(command_manager_b, "axisb_",
+                mjlib::base::string_span(output_buffer_b));
+  }
+
+  void CommandB(const std::string_view& message) {
+    RequiredSuccess required_success;
+    AsyncWrite(*pipe_b.side_b(), message, required_success.Make());
+    event_queue.Poll();
+  }
+
+  void ExpectResponseB(const std::string_view& message) {
+    BOOST_TEST(reader_b.data_.str() == message);
+    reader_b.data_.str("");
+    // Nothing is ever said to the other command manager.
+    BOOST_TEST(reader.data_.str() == "");
+  }
+};
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigViewEnumerate, ViewFixture) {
+  servo.value = 1;
+  servo_b.value = 2;
+  id.stuff = 3;
+  id_b.stuff = 4;
+  board.value = 5;
+
+  // The first command manager no longer lists what belongs to a view.
+  Command("conf enumerate\n");
+  ExpectResponse("servo.value 1\r\nid.stuff 3\r\nboard.value 5\r\nOK\r\n");
+
+  // The view lists its own groups by their plain names, in place of
+  // the first's, and what both share.
+  CommandB("conf enumerate\n");
+  ExpectResponseB("board.value 5\r\nservo.value 2\r\nid.stuff 4\r\nOK\r\n");
+
+  CommandB("conf enumerate servo\n");
+  ExpectResponseB("servo.value 2\r\nOK\r\n");
+
+  CommandB("conf enumerate board\n");
+  ExpectResponseB("board.value 5\r\nOK\r\n");
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigViewList, ViewFixture) {
+  Command("conf list\n");
+  ExpectResponse("servo\r\nid\r\nboard\r\nOK\r\n");
+
+  CommandB("conf list\n");
+  ExpectResponseB("board\r\nservo\r\nid\r\nhidden\r\nOK\r\n");
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigViewGetSet, ViewFixture) {
+  CommandB("conf set servo.value 12\n");
+  ExpectResponseB("OK\r\n");
+  BOOST_TEST(servo.value == 0);
+  BOOST_TEST(servo_b.value == 12);
+  BOOST_TEST(servo_count == 0);
+  BOOST_TEST(servo_b_count == 1);
+
+  CommandB("conf get servo.value\n");
+  ExpectResponseB("12\r\n");
+
+  Command("conf get servo.value\n");
+  ExpectResponse("0\r\n");
+
+  // What both share is the same from either.
+  CommandB("conf set board.value 7\n");
+  ExpectResponseB("OK\r\n");
+  BOOST_TEST(board.value == 7);
+  BOOST_TEST(board_count == 1);
+  Command("conf get board.value\n");
+  ExpectResponse("7\r\n");
+
+  // Groups that are not enumerated still work by name.
+  CommandB("conf set hidden.stuff 9\n");
+  ExpectResponseB("OK\r\n");
+  BOOST_TEST(hidden_b.stuff == 9);
+
+  CommandB("conf get nothing.value\n");
+  ExpectResponseB("ERR unknown group\r\n");
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigViewFullNames, ViewFixture) {
+  // The full name of any group works from every command manager.
+  Command("conf set axisb_servo.value 21\n");
+  ExpectResponse("OK\r\n");
+  BOOST_TEST(servo_b.value == 21);
+
+  Command("conf enumerate axisb_servo\n");
+  ExpectResponse("axisb_servo.value 21\r\nOK\r\n");
+
+  CommandB("conf get axisb_servo.value\n");
+  ExpectResponseB("21\r\n");
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigViewSchemaData, ViewFixture) {
+  servo.value = 0x11111111;
+  servo_b.value = 0x22222222;
+
+  CommandB("conf schema servo\n");
+  BOOST_TEST(reader_b.data_.str().substr(0, 15) == "cschema servo\r\n");
+  reader_b.data_.str("");
+
+  CommandB("conf data servo\n");
+  const std::string expected =
+      std::string("cdata servo\r\n") +
+      std::string("\x04\x00\x00\x00\x22\x22\x22\x22", 8);
+  ExpectResponseB(expected);
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigViewDefault, ViewFixture) {
+  servo.value = 1;
+  servo_b.value = 2;
+  board.value = 3;
+
+  // A view restores only its own.
+  CommandB("conf default\n");
+  ExpectResponseB("OK\r\n");
+  BOOST_TEST(servo.value == 1);
+  BOOST_TEST(servo_b.value == 0);
+  BOOST_TEST(board.value == 3);
+  BOOST_TEST(servo_count == 0);
+  BOOST_TEST(servo_b_count == 1);
+
+  // The first restores its own and what is shared.
+  servo_b.value = 2;
+  Command("conf default\n");
+  ExpectResponse("OK\r\n");
+  BOOST_TEST(servo.value == 0);
+  BOOST_TEST(servo_b.value == 2);
+  BOOST_TEST(board.value == 0);
+  BOOST_TEST(servo_count == 1);
+  BOOST_TEST(servo_b_count == 1);
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigViewFlash, ViewFixture) {
+  servo.value = 31;
+  servo_b.value = 32;
+
+  // There is one store, written and read whole from either.
+  CommandB("conf write\n");
+  ExpectResponseB("OK\r\n");
+
+  servo.value = 0;
+  servo_b.value = 0;
+
+  CommandB("conf load\n");
+  ExpectResponseB("OK\r\n");
+  BOOST_TEST(servo.value == 31);
+  BOOST_TEST(servo_b.value == 32);
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigViewInterleaved, ViewFixture) {
+  servo.value = 1;
+  servo_b.value = 2;
+  id.stuff = 3;
+  id_b.stuff = 4;
+  board.value = 5;
+
+  // Hold back what the first command manager writes, so that its
+  // enumeration is still in progress while the view runs one whole.
+  reader.AllowReads(0);
+  event_queue.Poll();
+  Command("conf enumerate\n");
+
+  CommandB("conf enumerate\n");
+  BOOST_TEST(reader_b.data_.str() ==
+             "board.value 5\r\nservo.value 2\r\nid.stuff 4\r\nOK\r\n");
+
+  reader.AllowReads(-1);
+  event_queue.Poll();
+  ExpectResponse("servo.value 1\r\nid.stuff 3\r\nboard.value 5\r\nOK\r\n");
 }
