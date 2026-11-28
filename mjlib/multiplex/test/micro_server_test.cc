@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: tests of answering on several IDs.
 
 #include "mjlib/multiplex/micro_server.h"
 
@@ -2074,7 +2076,7 @@ BOOST_FIXTURE_TEST_CASE(MultiIdBroadcastReachesAll, MultiFixture) {
   BOOST_TEST(receive_count == 0);
 }
 
-BOOST_FIXTURE_TEST_CASE(MultiIdTunnelsOnlyOnPrimary, MultiFixture) {
+BOOST_FIXTURE_TEST_CASE(MultiIdWithoutTunnelsIgnoresThem, MultiFixture) {
   char read_buffer[100] = {};
   int read_count = 0;
   tunnel->AsyncReadSome(read_buffer, [&](micro::error_code, ssize_t) {
@@ -2108,4 +2110,173 @@ BOOST_FIXTURE_TEST_CASE(MultiIdTunnelsOnlyOnPrimary, MultiFixture) {
   Send(1, true, payload);
   BOOST_TEST(read_count == 1);
   BOOST_TEST(server_a.writes_.size() == 1);
+}
+
+namespace {
+// The second ID has a tunnel of its own, with the same channel number
+// as the first ID's.
+struct MultiTunnelFixture : test::PersistentConfigFixture {
+  micro::StreamPipe dut_stream{event_queue.MakePoster()};
+
+  Server server_a;
+  Server server_b;
+  Server server_c;
+  uint8_t id_b = 2;
+  uint8_t id_c = 5;
+
+  mjlib::multiplex::MicroStreamDatagram stream_datagram{
+    &pool, dut_stream.side_b(), {}};
+  MicroServer dut{&pool, &stream_datagram, []() {
+      MicroServer::Options options;
+      options.max_servers = 3;
+      options.max_tunnel_streams = 2;
+      return options;
+    }()};
+
+  micro::AsyncStream* tunnel_a{dut.MakeTunnel(9)};
+  micro::AsyncStream* tunnel_b{dut.MakeTunnel(9, &server_b)};
+
+  char read_buffer_a[100] = {};
+  char read_buffer_b[100] = {};
+  int read_count_a = 0;
+  int read_count_b = 0;
+  ssize_t read_size_a = 0;
+  ssize_t read_size_b = 0;
+
+  char receive_buffer[256] = {};
+  int receive_count = 0;
+  ssize_t receive_size = 0;
+
+  MultiTunnelFixture() {
+    dut.Start(&server_a);
+    dut.AddServer(&id_b, &server_b);
+    dut.AddServer(&id_c, &server_c);
+
+    tunnel_a->AsyncReadSome(
+        read_buffer_a, [&](micro::error_code, ssize_t size) {
+          read_count_a++;
+          read_size_a = size;
+        });
+    tunnel_b->AsyncReadSome(
+        read_buffer_b, [&](micro::error_code, ssize_t size) {
+          read_count_b++;
+          read_size_b = size;
+        });
+  }
+
+  void Poll() {
+    event_queue.Poll();
+    dut.Poll();
+  }
+
+  void StartReceive() {
+    dut_stream.side_a()->AsyncReadSome(
+        receive_buffer, [&](micro::error_code ec, ssize_t size) {
+          BOOST_TEST(!ec);
+          receive_count++;
+          receive_size = size;
+        });
+  }
+
+  void Send(uint8_t destination, bool reply, const std::string& payload) {
+    Frame frame{0x00, reply, destination, payload};
+    const std::string encoded = frame.encode();
+    int write_count = 0;
+    AsyncWrite(*dut_stream.side_a(),
+               std::string_view(encoded.data(), encoded.size()),
+               [&](micro::error_code ec) {
+                 BOOST_TEST(!ec);
+                 write_count++;
+               });
+    Poll();
+    BOOST_TEST(write_count == 1);
+  }
+};
+
+// Three bytes to channel 9.
+const std::string kTunnelAbc{"\x40\x09\x03" "abc", 6};
+// Poll channel 9 for up to 16 bytes.
+const std::string kTunnelPoll{"\x42\x09\x10", 3};
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdTunnelPerId, MultiTunnelFixture) {
+  Send(2, false, kTunnelAbc + kWriteReg2);
+  BOOST_TEST(read_count_a == 0);
+  BOOST_TEST(read_count_b == 1);
+  BOOST_TEST(std::string_view(read_buffer_b, read_size_b) == "abc");
+  // What follows the tunnel data in the frame still applies.
+  BOOST_TEST(server_b.writes_.size() == 1);
+  BOOST_TEST(server_a.writes_.size() == 0);
+
+  Send(1, false, std::string{"\x40\x09\x02" "de", 5});
+  BOOST_TEST(read_count_a == 1);
+  BOOST_TEST(read_count_b == 1);
+  BOOST_TEST(std::string_view(read_buffer_a, read_size_a) == "de");
+  BOOST_TEST(dut.stats()->malformed_subframe == 0u);
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdTunnelReplyPerId, MultiTunnelFixture) {
+  int write_count_a = 0;
+  int write_count_b = 0;
+  tunnel_a->AsyncWriteSome(
+      "from a", [&](micro::error_code, ssize_t) { write_count_a++; });
+  tunnel_b->AsyncWriteSome(
+      "from b", [&](micro::error_code, ssize_t) { write_count_b++; });
+
+  StartReceive();
+  Poll();
+  Send(2, true, kTunnelPoll);
+  BOOST_TEST(write_count_a == 0);
+  BOOST_TEST(write_count_b == 1);
+  BOOST_TEST(receive_count == 1);
+  {
+    Frame expected{0x02, false, 0x00,
+                   std::string{"\x41\x09\x06" "from b", 9}};
+    BOOST_TEST(std::string_view(receive_buffer, receive_size) ==
+               expected.encode());
+  }
+
+  receive_count = 0;
+  StartReceive();
+  Poll();
+  Send(1, true, kTunnelPoll);
+  BOOST_TEST(write_count_a == 1);
+  BOOST_TEST(write_count_b == 1);
+  BOOST_TEST(receive_count == 1);
+  {
+    Frame expected{0x01, false, 0x00,
+                   std::string{"\x41\x09\x06" "from a", 9}};
+    BOOST_TEST(std::string_view(receive_buffer, receive_size) ==
+               expected.encode());
+  }
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdTunnelBroadcast, MultiTunnelFixture) {
+  // Tunnel data sent to every ID is for the first alone, as it would
+  // otherwise be taken once by each.
+  Send(0x7f, false, kTunnelAbc + kWriteReg2);
+  BOOST_TEST(read_count_a == 1);
+  BOOST_TEST(read_count_b == 0);
+  BOOST_TEST(server_a.writes_.size() == 1);
+  BOOST_TEST(server_b.writes_.size() == 1);
+  BOOST_TEST(server_c.writes_.size() == 1);
+  BOOST_TEST(dut.stats()->malformed_subframe == 0u);
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdTunnelOtherIdHasNone, MultiTunnelFixture) {
+  // The third ID has no tunnels, so it steps over them.
+  Send(5, false, kTunnelAbc + kWriteReg2);
+  BOOST_TEST(read_count_a == 0);
+  BOOST_TEST(read_count_b == 0);
+  BOOST_TEST(server_c.writes_.size() == 1);
+  BOOST_TEST(dut.stats()->malformed_subframe == 0u);
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdTunnelUnknownChannel, MultiTunnelFixture) {
+  // As for the first ID, a channel that an ID with tunnels does not
+  // have ends the frame.
+  Send(2, false, std::string{"\x40\x07\x03" "abc", 6} + kWriteReg2);
+  BOOST_TEST(read_count_b == 0);
+  BOOST_TEST(server_b.writes_.size() == 0);
+  BOOST_TEST(dut.stats()->malformed_subframe == 1u);
 }

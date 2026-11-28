@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified by Tenax Motion, 2026: answer on several IDs, one register
-// map per ID (AddServer).
+// map per ID (AddServer), each with its own tunnels.
 
 #include "mjlib/multiplex/micro_server.h"
 
@@ -50,6 +50,8 @@ class MicroServer::Impl {
     void set_parent(Impl* impl) { parent_ = impl; }
     uint32_t id() const { return id_; }
     void set_id(uint32_t id) { id_ = id; }
+    const Server* owner() const { return owner_; }
+    void set_owner(const Server* owner) { owner_ = owner; }
 
     void AsyncReadSome(const base::string_span& buffer,
                        const micro::SizeCallback& callback) override {
@@ -106,6 +108,9 @@ class MicroServer::Impl {
 
     Impl* parent_ = nullptr;
     uint32_t id_ = 0;
+    // The added server whose ID this is a channel of, or null for
+    // the ID in config().
+    const Server* owner_ = nullptr;
 
     base::string_span read_buffer_;
     micro::SizeCallback read_callback_;
@@ -148,12 +153,13 @@ class MicroServer::Impl {
     }
   }
 
-  micro::AsyncStream* MakeTunnel(uint32_t id) {
+  micro::AsyncStream* MakeTunnel(uint32_t id, const Server* owner) {
     MJ_ASSERT(id != 0);
     for (auto& tunnel : tunnels_) {
       if (tunnel.id() == 0) {
         // This one is unallocated.
         tunnel.set_id(id);
+        tunnel.set_owner(owner);
         return &tunnel;
       }
     }
@@ -232,23 +238,25 @@ class MicroServer::Impl {
     if (destination == kBroadcastId) {
       stats_.wrong_id++;
 
-      ProcessFrameFor(server_, config_.id, true, true);
+      ProcessFrameFor(server_, nullptr, config_.id, true, true);
       for (auto& extra : extra_servers_) {
         if (extra.server == nullptr) { break; }
-        ProcessFrameFor(extra.server, *extra.id, false, false);
+        // Its tunnels are for frames sent to it alone.
+        ProcessFrameFor(extra.server, extra.server, *extra.id, false, false);
       }
       return;
     }
 
     if (destination == (config_.id & 0x7f)) {
-      ProcessFrameFor(server_, config_.id, true, true);
+      ProcessFrameFor(server_, nullptr, config_.id, true, true);
       return;
     }
 
     for (auto& extra : extra_servers_) {
       if (extra.server == nullptr) { break; }
       if (destination == (*extra.id & 0x7f)) {
-        ProcessFrameFor(extra.server, *extra.id, false, true);
+        ProcessFrameFor(extra.server, extra.server, *extra.id,
+                        HasTunnel(extra.server), true);
         return;
       }
     }
@@ -256,10 +264,13 @@ class MicroServer::Impl {
     stats_.wrong_id++;
   }
 
-  void ProcessFrameFor(Server* server, uint8_t id,
-                       bool tunnels, bool may_reply)
+  /// @param tunnel_owner is what the tunnels of this ID were made
+  /// with: null for the ID in config().
+  void ProcessFrameFor(Server* server, const Server* tunnel_owner,
+                       uint8_t id, bool tunnels, bool may_reply)
       __attribute__ ((optimize("O3"))) {
     active_server_ = server;
+    tunnel_owner_ = tunnel_owner;
     tunnels_active_ = tunnels;
 
     // Cap the response buffer view to the transport's advertised
@@ -358,8 +369,9 @@ class MicroServer::Impl {
           (subframe_type == u8(Subframe::kClientToServer) ||
            subframe_type == u8(Subframe::kClientPollServer) ||
            subframe_type == u8(Subframe::kClientPollServerFlow))) {
-        // Tunnels belong to the primary ID only.  Step over the
-        // subframe so any register subframes after it still apply.
+        // This ID has no tunnels, or the frame was sent to every
+        // ID.  Step over the subframe so any register subframes
+        // after it still apply.
         if (SkipTunnelSubframe(subframe_type, buffer_stream, str)) {
           stats_.malformed_subframe++;
           return;
@@ -877,11 +889,22 @@ class MicroServer::Impl {
     return false;
   }
 
+  // The tunnel with this channel number of the ID whose frame is
+  // being processed.
   TunnelStream* FindTunnel(uint32_t id) {
     for (auto& tunnel : tunnels_) {
-      if (tunnel.id() == id) { return &tunnel; }
+      if (tunnel.id() == id && tunnel.owner() == tunnel_owner_) {
+        return &tunnel;
+      }
     }
     return nullptr;
+  }
+
+  bool HasTunnel(const Server* owner) const {
+    for (const auto& tunnel : tunnels_) {
+      if (tunnel.id() != 0 && tunnel.owner() == owner) { return true; }
+    }
+    return false;
   }
 
   const Options options_;
@@ -896,6 +919,7 @@ class MicroServer::Impl {
 
   // Valid only while a frame is being processed.
   Server* active_server_ = nullptr;
+  const Server* tunnel_owner_ = nullptr;
   bool tunnels_active_ = true;
 
   Config config_;
@@ -925,8 +949,9 @@ MicroServer::MicroServer(
 
 MicroServer::~MicroServer() {}
 
-micro::AsyncStream* MicroServer::MakeTunnel(uint32_t id) {
-  return impl_->MakeTunnel(id);
+micro::AsyncStream* MicroServer::MakeTunnel(uint32_t id,
+                                            const Server* server) {
+  return impl_->MakeTunnel(id, server);
 }
 
 void MicroServer::Start(Server* server) {

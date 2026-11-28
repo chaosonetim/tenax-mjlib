@@ -13,7 +13,8 @@
 // limitations under the License.
 //
 // Modified by Tenax Motion, 2026: the number of registered names is a
-// constructor option.
+// constructor option, and further command managers can each be given
+// a view of the groups with one prefix (AddView).
 
 #include "mjlib/micro/persistent_config.h"
 
@@ -67,37 +68,130 @@ class PersistentConfig::Impl {
  public:
   Impl(Pool& pool, CommandManager& command_manager, FlashInterface& flash,
        mjlib::base::string_span output_buffer, size_t max_elements)
-      : pool_(pool), flash_(flash), elements_(&pool, max_elements),
-        output_buffer_(output_buffer) {
+      : pool_(pool), flash_(flash), elements_(&pool, max_elements) {
+    primary_.output_buffer = output_buffer;
     command_manager.Register("conf", [this](auto&& a, auto&& b) {
-        this->Command(a, b);
+        this->Command(primary_, a, b);
       });
   }
 
-  void Command(const std::string_view& command,
+  /// What one command manager is served with: the groups it is shown,
+  /// and the state of the command it has in progress.
+  struct View {
+    /// Empty for the view of the constructor's command manager.
+    std::string_view prefix;
+    mjlib::base::string_span output_buffer;
+    std::size_t current_list_index = 0;
+
+    CommandManager::Response current_response;
+    std::size_t current_enumerate_index = 0;
+    std::size_t end_enumerate_index = 0;
+    bool enumerate_one = false;
+    detail::EnumerateArchive::Context enumerate_context;
+
+    View* next = nullptr;
+  };
+
+  void AddView(CommandManager& command_manager,
+               const std::string_view& prefix,
+               mjlib::base::string_span output_buffer) {
+    MJ_ASSERT(!prefix.empty());
+
+    PoolPtr<View> view(&pool_);
+    view->prefix = prefix;
+    view->output_buffer = output_buffer;
+
+    View* last = &primary_;
+    while (last->next) { last = last->next; }
+    last->next = view.get();
+
+    command_manager.Register(
+        "conf", [this, v = view.get()](auto&& a, auto&& b) {
+          this->Command(*v, a, b);
+        });
+  }
+
+  /// The view a group belongs to: the one with the longest prefix that
+  /// the name of the group starts with.
+  const View* Owner(const std::string_view& name) const {
+    const View* result = &primary_;
+    for (const View* view = primary_.next; view; view = view->next) {
+      if (view->prefix.size() > result->prefix.size() &&
+          name.substr(0, view->prefix.size()) == view->prefix) {
+        result = view;
+      }
+    }
+    return result;
+  }
+
+  /// If @p view has a group of its own which it calls @p name.
+  bool HasOwn(const View& view, const std::string_view& name) const {
+    for (const auto& item : elements_) {
+      if (IsOwnName(view, item.first, name)) { return true; }
+    }
+    return false;
+  }
+
+  static bool IsOwnName(const View& view,
+                        const std::string_view& full_name,
+                        const std::string_view& name) {
+    return full_name.size() == view.prefix.size() + name.size() &&
+        full_name.substr(0, view.prefix.size()) == view.prefix &&
+        full_name.substr(view.prefix.size()) == name;
+  }
+
+  /// If @p view lists the group: its own, and each group of no view
+  /// (one that every view shares) that none of its own has the name
+  /// of.
+  bool Shows(const View& view, const std::string_view& full_name) const {
+    const View* const owner = Owner(full_name);
+    if (owner == &view) { return true; }
+    return owner == &primary_ && !HasOwn(view, full_name);
+  }
+
+  /// What @p view calls the group.
+  std::string_view NameIn(const View& view,
+                          const std::string_view& full_name) const {
+    return Owner(full_name) == &view ?
+        full_name.substr(view.prefix.size()) : full_name;
+  }
+
+  /// The group @p view calls @p name: its own of that name if it has
+  /// one, otherwise the group with exactly that name.
+  auto Find(const View& view, const std::string_view& name) {
+    if (!view.prefix.empty()) {
+      for (auto it = elements_.begin(); it != elements_.end(); ++it) {
+        if (IsOwnName(view, it->first, name)) { return it; }
+      }
+    }
+    return elements_.find(name);
+  }
+
+  void Command(View& view,
+               const std::string_view& command,
                const CommandManager::Response& response) {
     base::Tokenizer tokenizer(command, " ");
     auto cmd = tokenizer.next();
     if (cmd == "enumerate") {
-      Enumerate(tokenizer.remaining(), response);
+      Enumerate(view, tokenizer.remaining(), response);
     } else if (cmd == "list") {
-      List(response);
+      List(view, response);
     } else if (cmd == "schema") {
-      Schema(tokenizer.remaining(), response);
+      Schema(view, tokenizer.remaining(), response);
     } else if (cmd == "data") {
-      Data(tokenizer.remaining(), response);
+      Data(view, tokenizer.remaining(), response);
     } else if (cmd == "get") {
-      Get(tokenizer.remaining(), response);
+      Get(view, tokenizer.remaining(), response);
     } else if (cmd == "set") {
-      Set(tokenizer.remaining(), response);
+      Set(view, tokenizer.remaining(), response);
     } else if (cmd == "load") {
       Load(response);
     } else if (cmd == "write") {
       Write(response);
     } else if (cmd == "size") {
-      Size(response);
+      Size(view, response);
     } else if (cmd == "default") {
-      Default(response);
+      Default(view, response);
     } else {
       UnknownCommand(cmd, response);
     }
@@ -111,100 +205,117 @@ class PersistentConfig::Impl {
 
   using ElementMap = PoolMap<std::string_view, Element>;
 
-  void Enumerate(const std::string_view& maybe_field,
+  void Enumerate(View& view,
+                 const std::string_view& maybe_field,
                  const CommandManager::Response& response) {
-    current_response_ = response;
+    view.current_response = response;
     if (maybe_field.size()) {
       // Look up this field.
-      const auto element_it = elements_.find(maybe_field);
+      const auto element_it = Find(view, maybe_field);
       if (element_it == elements_.end()) {
         WriteMessage("ERR unknown group\r\n", response);
         return;
       }
-      current_enumerate_index_ = element_it - elements_.begin();
-      end_enumerate_index_ = current_enumerate_index_ + 1;
+      view.current_enumerate_index = element_it - elements_.begin();
+      view.end_enumerate_index = view.current_enumerate_index + 1;
+      view.enumerate_one = true;
     } else {
-      current_enumerate_index_ = 0;
-      end_enumerate_index_ = elements_.size();
+      view.current_enumerate_index = 0;
+      view.end_enumerate_index = elements_.size();
+      view.enumerate_one = false;
     }
 
-    EnumerateCallback({});
+    EnumerateCallback(view, {});
   }
 
-  void EnumerateCallback(error_code error) {
+  void EnumerateCallback(View& view, error_code error) {
     if (error) {
-      current_response_.callback(error);
+      view.current_response.callback(error);
       return;
     }
 
     while (true) {
-      const auto element_it = elements_.begin() + current_enumerate_index_;
-      if (current_enumerate_index_ >= end_enumerate_index_ ||
+      const auto element_it =
+          elements_.begin() + view.current_enumerate_index;
+      if (view.current_enumerate_index >= view.end_enumerate_index ||
           element_it == elements_.end()) {
-        WriteOK(current_response_);
+        WriteOK(view.current_response);
         return;
       }
 
-      current_enumerate_index_++;
+      view.current_enumerate_index++;
 
       if (!element_it->second.enumerate) {
         continue;
       }
 
+      // A group asked for by name is given whoever it belongs to.
+      if (!view.enumerate_one && !Shows(view, element_it->first)) {
+        continue;
+      }
+
       element_it->second.serializable->Enumerate(
-          &this->enumerate_context_,
-          output_buffer_,
-          element_it->first,
-          *current_response_.stream,
-          [this](error_code err) { this->EnumerateCallback(err); });
+          &view.enumerate_context,
+          view.output_buffer,
+          NameIn(view, element_it->first),
+          *view.current_response.stream,
+          [this, v = &view](error_code err) {
+            this->EnumerateCallback(*v, err);
+          });
       return;
     }
   }
 
-  void List(const CommandManager::Response& response) {
-    current_response_ = response;
-    current_list_index_ = 0;
-    ListCallback({});
+  void List(View& view, const CommandManager::Response& response) {
+    view.current_response = response;
+    view.current_list_index = 0;
+    ListCallback(view, {});
   }
 
-  void ListCallback(error_code error) {
+  void ListCallback(View& view, error_code error) {
     if (error) {
-      current_response_.callback(error);
+      view.current_response.callback(error);
       return;
     }
 
-    if (current_list_index_ >= elements_.size()) {
-      WriteOK(current_response_);
+    while (view.current_list_index < elements_.size() &&
+           !Shows(view, elements_[view.current_list_index].first)) {
+      view.current_list_index++;
+    }
+
+    if (view.current_list_index >= elements_.size()) {
+      WriteOK(view.current_response);
       return;
     }
 
-    auto element_it = elements_.begin() + current_list_index_;
+    auto element_it = elements_.begin() + view.current_list_index;
     if (element_it == elements_.end()) {
-      WriteOK(current_response_);
+      WriteOK(view.current_response);
       return;
     }
 
-    const auto& name = element_it->first;
-    current_list_index_++;
+    const auto name = NameIn(view, element_it->first);
+    view.current_list_index++;
 
-    char *ptr = output_buffer_.data();
+    char *ptr = view.output_buffer.data();
     std::copy(name.begin(), name.end(), ptr);
     ptr += name.size();
     *ptr = '\r';
     ptr++;
     *ptr = '\n';
     ptr++;
-    AsyncWrite(*current_response_.stream,
-               std::string_view(output_buffer_.data(),
-                                ptr - output_buffer_.data()),
-               [this](error_code ec) {
-                 ListCallback(ec);
+    AsyncWrite(*view.current_response.stream,
+               std::string_view(view.output_buffer.data(),
+                                ptr - view.output_buffer.data()),
+               [this, v = &view](error_code ec) {
+                 ListCallback(*v, ec);
                });
   }
 
   typedef base::inplace_function<void (Element*,
                                        base::WriteStream*)> WorkFunction;
-  void Emit(const std::string_view& prefix,
+  void Emit(View& view,
+            const std::string_view& prefix,
             const std::string_view& name,
             Element* element,
             WorkFunction work,
@@ -214,20 +325,20 @@ class PersistentConfig::Impl {
     // there's room for the four-byte size placeholder we reserve via
     // skip() and for whatever work() chooses to emit. Bail with an
     // error response if not -- this used to silently corrupt memory
-    // past output_buffer_ when prefix+name+CRLF filled the buffer
+    // past view.output_buffer when prefix+name+CRLF filled the buffer
     // within < 4 bytes of the end and work() wrote zero bytes.
     if (prefix.size() + name.size() + 2 + sizeof(uint32_t) >
-        static_cast<size_t>(output_buffer_.size())) {
+        static_cast<size_t>(view.output_buffer.size())) {
       WriteMessage("ERR name too long\r\n", response);
       return;
     }
 
-    base::BufferWriteStream ostream{output_buffer_};
+    base::BufferWriteStream ostream{view.output_buffer};
     ostream.write(prefix);
     ostream.write(name);
     ostream.write("\r\n");
 
-    char* const size_position = output_buffer_.data() + ostream.offset();
+    char* const size_position = view.output_buffer.data() + ostream.offset();
     ostream.skip(sizeof(uint32_t));
 
     work(element, &ostream);
@@ -235,24 +346,26 @@ class PersistentConfig::Impl {
     base::BufferWriteStream size_stream({size_position, sizeof(uint32_t)});
     mjlib::telemetry::WriteStream tstream(size_stream);
     tstream.Write(static_cast<uint32_t>(
-                      ostream.offset() + output_buffer_.data() -
+                      ostream.offset() + view.output_buffer.data() -
                       (size_position + sizeof(uint32_t))));
 
     AsyncWrite(
         *response.stream,
-        std::string_view(output_buffer_.data(), ostream.offset()),
+        std::string_view(view.output_buffer.data(), ostream.offset()),
         response.callback);
   }
 
-  void Schema(const std::string_view& name,
+  void Schema(View& view,
+              const std::string_view& name,
               const CommandManager::Response& response) {
-    const auto element_it = elements_.find(name);
+    const auto element_it = Find(view, name);
     if (element_it == elements_.end()) {
       WriteMessage("ERR unknown name\r\n", response);
       return;
     }
 
     Emit(
+        view,
         "cschema ",
         name,
         &element_it->second,
@@ -262,15 +375,17 @@ class PersistentConfig::Impl {
         response);
   }
 
-  void Data(const std::string_view& name,
+  void Data(View& view,
+            const std::string_view& name,
             const CommandManager::Response& response) {
-    const auto it = elements_.find(name);
+    const auto it = Find(view, name);
     if (it == elements_.end()) {
       WriteMessage(std::string_view("ERR unknown name\r\n"), response);
       return;
     }
 
-    Emit("cdata ",
+    Emit(view,
+         "cdata ",
          name,
          &it->second,
          [](Element* element, base::WriteStream* stream) {
@@ -279,28 +394,28 @@ class PersistentConfig::Impl {
          response);
   }
 
-  void Get(const std::string_view& field,
+  void Get(View& view,
+           const std::string_view& field,
            const CommandManager::Response& response) {
     base::Tokenizer tokenizer(field, ".");
     auto group = tokenizer.next();
-    const auto element_it = elements_.find(group);
+    const auto element_it = Find(view, group);
     if (element_it == elements_.end()) {
       WriteMessage("ERR unknown group\r\n", response);
     } else {
-      current_response_ = response;
+      view.current_response = response;
       auto& element = element_it->second;
       const int err =
           element.serializable->Read(
               tokenizer.remaining(),
-              output_buffer_,
-              *current_response_.stream,
-              [this](error_code error) {
+              view.output_buffer,
+              *view.current_response.stream,
+              [this, v = &view](error_code error) {
                 if (error) {
-                  this->current_response_.callback(error);
+                  v->current_response.callback(error);
                   return;
                 }
-                WriteMessage("\r\n",
-                             this->current_response_);
+                WriteMessage("\r\n", v->current_response);
               });
       if (err) {
         WriteMessage("ERR error reading\r\n", response);
@@ -308,11 +423,12 @@ class PersistentConfig::Impl {
     }
   }
 
-  void Set(const std::string_view& command,
+  void Set(View& view,
+           const std::string_view& command,
            const CommandManager::Response& response) {
     base::Tokenizer tokenizer(command, ".");
     auto group = tokenizer.next();
-    const auto element_it = elements_.find(group);
+    const auto element_it = Find(view, group);
     if (element_it == elements_.end()) {
       WriteMessage("ERR unknown group\r\n", response);
     } else {
@@ -436,7 +552,7 @@ class PersistentConfig::Impl {
     WriteOK(response);
   }
 
-  void Size(const CommandManager::Response& response) {
+  void Size(View& view, const CommandManager::Response& response) {
     SizeCountingStream size_stream;
     telemetry::WriteStream stream(size_stream);
 
@@ -449,18 +565,22 @@ class PersistentConfig::Impl {
     }
     stream.Write(static_cast<uint32_t>(0));
 
-    ::snprintf(output_buffer_.data(), output_buffer_.size(),
+    ::snprintf(view.output_buffer.data(), view.output_buffer.size(),
                "%d\r\nOK\r\n", static_cast<int>(size_stream.size()));
-    WriteMessage(output_buffer_.data(), response);
+    WriteMessage(view.output_buffer.data(), response);
   }
 
-  void Default(const CommandManager::Response& response) {
+  void Default(View& view, const CommandManager::Response& response) {
+    // Each view restores its own groups, and the first also those
+    // that every view shares.
     for (auto& item_pair : elements_) {
+      if (Owner(item_pair.first) != &view) { continue; }
       item_pair.second.serializable->SetDefault();
     }
 
     // Notify everyone that they have changed.
     for (auto& element: elements_) {
+      if (Owner(element.first) != &view) { continue; }
       element.second.updated();
     }
 
@@ -486,13 +606,7 @@ class PersistentConfig::Impl {
 
   ElementMap elements_;
 
-  mjlib::base::string_span output_buffer_;
-  std::size_t current_list_index_ = 0;
-
-  CommandManager::Response current_response_;
-  std::size_t current_enumerate_index_ = 0;
-  std::size_t end_enumerate_index_ = 0;
-  detail::EnumerateArchive::Context enumerate_context_;
+  View primary_;
 };
 
 PersistentConfig::PersistentConfig(
@@ -503,6 +617,13 @@ PersistentConfig::PersistentConfig(
 }
 
 PersistentConfig::~PersistentConfig() {
+}
+
+void PersistentConfig::AddView(
+    CommandManager& command_manager,
+    const std::string_view& prefix,
+    mjlib::base::string_span output_buffer) {
+  impl_->AddView(command_manager, prefix, output_buffer);
 }
 
 void PersistentConfig::Load() {

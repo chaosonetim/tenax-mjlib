@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Modified by Tenax Motion, 2026: one server can answer on several
-// IDs, one register map per ID (AddServer).
+// IDs, one register map per ID (AddServer), each with its own tunnels.
 
 #pragma once
 
@@ -95,17 +95,23 @@ class MicroServer : public Format {
 
   /// Allocate a "tunnel", where an AsyncStream is tunneled over the
   /// multiplex connection.
-  micro::AsyncStream* MakeTunnel(uint32_t id);
+  ///
+  /// @param server if given, is a server that is (or will be) added
+  /// with AddServer: the tunnel is then channel @p id of that
+  /// server's ID rather than of the ID in config(), as if it were a
+  /// separate device.  Each ID has its own channel numbers.
+  micro::AsyncStream* MakeTunnel(uint32_t id,
+                                 const Server* server = nullptr);
 
   void Start(Server*);
 
   /// Also answer frames sent to `*id` with `server`, as if it were a
   /// separate device.  `id` is read for every frame, so it may point
-  /// into persistent configuration.  Tunnels belong only to the ID in
-  /// config() and are ignored in frames for any other ID.  A broadcast
-  /// frame is given to every server, and only the server passed to
-  /// Start may reply to it.  When two IDs match, the one in config()
-  /// wins.
+  /// into persistent configuration.  Its ID has the tunnels made
+  /// with `server`; if there are none, tunnel subframes in its frames
+  /// are ignored.  A broadcast frame is given to every server, and
+  /// only the server passed to Start may reply to it or is given its
+  /// tunnel subframes.  When two IDs match, the one in config() wins.
   ///
   /// At most Options::max_servers - 1 may be added.
   void AddServer(const uint8_t* id, Server* server);
