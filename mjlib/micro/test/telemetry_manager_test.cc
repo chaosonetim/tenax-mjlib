@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: tests of more registered names than
+// the default.
 
 #include "mjlib/micro/telemetry_manager.h"
 
@@ -185,4 +188,31 @@ BOOST_FIXTURE_TEST_CASE(TelemetryManagerOverloadTest, Fixture) {
     BOOST_TEST(counts["my_data"] == 3);
     BOOST_TEST(counts["other_data"] == 3);
   }
+}
+
+namespace {
+constexpr int kManyNames = 20;
+constexpr const char* kNames[kManyNames] = {
+  "n00", "n01", "n02", "n03", "n04", "n05", "n06", "n07", "n08", "n09",
+  "n10", "n11", "n12", "n13", "n14", "n15", "n16", "n17", "n18", "n19",
+};
+
+struct ManyFixture : test::CommandManagerFixture {
+  char output_buffer[2048] = {};
+  // More than the default of 16.
+  TelemetryManager dut{
+    &pool, &command_manager, &write_stream, output_buffer, kManyNames};
+  test::MyData data[kManyNames];
+
+  ManyFixture() {
+    for (int i = 0; i < kManyNames; i++) {
+      dut.Register(kNames[i], &data[i]);
+    }
+  }
+};
+}
+
+BOOST_FIXTURE_TEST_CASE(TelemetryManagerMaxElements, ManyFixture) {
+  Command("tel get n19\n");
+  ExpectResponse(str("emit n19\r\n\x04\x00\x00\x00\x00\x00\x00\x00"));
 }

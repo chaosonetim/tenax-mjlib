@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: the number of registered names is a
+// constructor option.
 
 #pragma once
 
@@ -29,10 +32,12 @@ namespace micro {
 /// serializable structures.
 class TelemetryManager {
  public:
+  /// @param max_elements is how many names may be registered.
   TelemetryManager(Pool*,
                    CommandManager*,
                    AsyncExclusive<AsyncWriteStream>* write_stream,
-                   mjlib::base::string_span output_buffer);
+                   mjlib::base::string_span output_buffer,
+                   size_t max_elements = 16);
   ~TelemetryManager();
 
   /// Associate the serializable with the given name.
