@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: the number of registered names is a
+// constructor option.
 
 #include "mjlib/micro/persistent_config.h"
 
@@ -47,8 +50,6 @@
 namespace mjlib {
 namespace micro {
 namespace {
-constexpr int kMaxSize = 16;
-
 class SizeCountingStream : public base::WriteStream {
  public:
   void write(const std::string_view& data) override {
@@ -65,8 +66,8 @@ class SizeCountingStream : public base::WriteStream {
 class PersistentConfig::Impl {
  public:
   Impl(Pool& pool, CommandManager& command_manager, FlashInterface& flash,
-       mjlib::base::string_span output_buffer)
-      : pool_(pool), flash_(flash), elements_(&pool, kMaxSize),
+       mjlib::base::string_span output_buffer, size_t max_elements)
+      : pool_(pool), flash_(flash), elements_(&pool, max_elements),
         output_buffer_(output_buffer) {
     command_manager.Register("conf", [this](auto&& a, auto&& b) {
         this->Command(a, b);
@@ -496,8 +497,9 @@ class PersistentConfig::Impl {
 
 PersistentConfig::PersistentConfig(
     Pool& pool, CommandManager& command_manager, FlashInterface& flash,
-    mjlib::base::string_span output_buffer)
-    : impl_(&pool, pool, command_manager, flash, output_buffer) {
+    mjlib::base::string_span output_buffer, size_t max_elements)
+    : impl_(&pool, pool, command_manager, flash, output_buffer,
+            max_elements) {
 }
 
 PersistentConfig::~PersistentConfig() {

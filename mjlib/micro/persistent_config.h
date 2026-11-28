@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: the number of registered names is a
+// constructor option.
 
 #pragma once
 
@@ -27,8 +30,10 @@ namespace micro {
 
 class PersistentConfig {
  public:
+  /// @param max_elements is how many names may be registered.
   PersistentConfig(Pool&, CommandManager&, FlashInterface&,
-                   mjlib::base::string_span);
+                   mjlib::base::string_span,
+                   size_t max_elements = 16);
   ~PersistentConfig();
 
   struct RegisterOptions {

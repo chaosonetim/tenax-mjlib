@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: the number of registered names is a
+// constructor option.
 
 #include "mjlib/micro/telemetry_manager.h"
 
@@ -32,8 +35,6 @@ namespace {
 // emitted per-update.
 constexpr int kMinRateMs = 10;
 
-// TODO(jpieper): Expose this as a constructor time option.
-constexpr size_t kMaxElements = 16;
 }
 
 class TelemetryManager::Impl {
@@ -51,10 +52,10 @@ class TelemetryManager::Impl {
 
   Impl(Pool* pool, CommandManager* command_manager,
        AsyncExclusive<AsyncWriteStream>* write_stream,
-       mjlib::base::string_span output_buffer)
+       mjlib::base::string_span output_buffer, size_t max_elements)
       : pool_(pool),
         write_stream_(write_stream),
-        elements_(pool, kMaxElements),
+        elements_(pool, max_elements),
         output_buffer_(output_buffer) {
     command_manager->Register("tel", [this](auto&& name, auto&& response) {
         this->Command(name, response);
@@ -386,8 +387,9 @@ class TelemetryManager::Impl {
 TelemetryManager::TelemetryManager(
     Pool* pool, CommandManager* command_manager,
     AsyncExclusive<AsyncWriteStream>* write_stream,
-    mjlib::base::string_span output_buffer)
-    : impl_(pool, pool, command_manager, write_stream, output_buffer) {}
+    mjlib::base::string_span output_buffer, size_t max_elements)
+    : impl_(pool, pool, command_manager, write_stream, output_buffer,
+            max_elements) {}
 
 TelemetryManager::~TelemetryManager() {}
 

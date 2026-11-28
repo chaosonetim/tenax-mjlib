@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: tests of more registered names than
+// the default.
 
 #include "mjlib/micro/persistent_config.h"
 
@@ -160,4 +163,33 @@ BOOST_FIXTURE_TEST_CASE(PersistentConfigFlash, Fixture) {
 
   Command("conf size\n");
   ExpectResponse("72\r\nOK\r\n");
+}
+
+namespace {
+constexpr int kManyNames = 20;
+constexpr const char* kNames[kManyNames] = {
+  "n00", "n01", "n02", "n03", "n04", "n05", "n06", "n07", "n08", "n09",
+  "n10", "n11", "n12", "n13", "n14", "n15", "n16", "n17", "n18", "n19",
+};
+
+struct ManyFixture : test::CommandManagerFixture {
+  test::StubFlash flash;
+  char output_buffer[4096] = {};
+  // More than the default of 16.
+  PersistentConfig dut{
+    pool, command_manager, flash,
+    mjlib::base::string_span(output_buffer), kManyNames};
+  test::MyData data[kManyNames];
+
+  ManyFixture() {
+    for (int i = 0; i < kManyNames; i++) {
+      dut.Register(kNames[i], &data[i], []() {});
+    }
+  }
+};
+}
+
+BOOST_FIXTURE_TEST_CASE(PersistentConfigMaxElements, ManyFixture) {
+  Command("conf get n19.value\n");
+  ExpectResponse("0\r\n");
 }
