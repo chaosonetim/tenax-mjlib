@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: one server can answer on several
+// IDs, one register map per ID (AddServer).
 
 #pragma once
 
@@ -81,6 +84,10 @@ class MicroServer : public Format {
     int buffer_size = 256;
     int max_tunnel_streams = 1;
     uint8_t default_id = 1;
+
+    /// The total number of register maps, including the one passed to
+    /// Start.  Each one after the first is added with AddServer.
+    int max_servers = 1;
   };
 
   MicroServer(micro::Pool*, MicroDatagramServer*, const Options&);
@@ -91,6 +98,17 @@ class MicroServer : public Format {
   micro::AsyncStream* MakeTunnel(uint32_t id);
 
   void Start(Server*);
+
+  /// Also answer frames sent to `*id` with `server`, as if it were a
+  /// separate device.  `id` is read for every frame, so it may point
+  /// into persistent configuration.  Tunnels belong only to the ID in
+  /// config() and are ignored in frames for any other ID.  A broadcast
+  /// frame is given to every server, and only the server passed to
+  /// Start may reply to it.  When two IDs match, the one in config()
+  /// wins.
+  ///
+  /// At most Options::max_servers - 1 may be added.
+  void AddServer(const uint8_t* id, Server* server);
 
   void Poll();
 
