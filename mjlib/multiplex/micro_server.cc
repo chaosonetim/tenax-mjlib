@@ -11,9 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by Tenax Motion, 2026: answer on several IDs, one register
+// map per ID (AddServer).
 
 #include "mjlib/multiplex/micro_server.h"
 
+#include <algorithm>
 #include <functional>
 
 #include <boost/crc.hpp>
@@ -135,7 +139,9 @@ class MicroServer::Impl {
                          pool->Allocate(options.buffer_size, 1))),
         write_buffer_(static_cast<char*>(
                           pool->Allocate(options.buffer_size, 1))),
-        tunnels_(pool, static_cast<size_t>(options.max_tunnel_streams)) {
+        tunnels_(pool, static_cast<size_t>(options.max_tunnel_streams)),
+        extra_servers_(pool, static_cast<size_t>(
+                           std::max(0, options.max_servers - 1))) {
     config_.id = options.default_id;
     for (auto& tunnel : tunnels_) {
       tunnel.set_parent(this);
@@ -159,6 +165,20 @@ class MicroServer::Impl {
   void Start(Server* server) {
     server_ = server;
     MaybeStartReadFrame();
+  }
+
+  void AddServer(const uint8_t* id, Server* server) {
+    MJ_ASSERT(id != nullptr);
+    MJ_ASSERT(server != nullptr);
+    for (auto& extra : extra_servers_) {
+      if (extra.server == nullptr) {
+        extra.id = id;
+        extra.server = server;
+        return;
+      }
+    }
+
+    MJ_ASSERT(false);
   }
 
   void Poll() {
@@ -207,14 +227,40 @@ class MicroServer::Impl {
 
   // Return true if more data might be available in the buffer.
   void ProcessFrame() __attribute__ ((optimize("O3"))) {
-    if ((read_header_.destination == kBroadcastId) ||
-        (read_header_.destination != (config_.id & 0x7f))) {
+    const auto destination = read_header_.destination;
+
+    if (destination == kBroadcastId) {
       stats_.wrong_id++;
 
-      if (read_header_.destination != kBroadcastId) {
+      ProcessFrameFor(server_, config_.id, true, true);
+      for (auto& extra : extra_servers_) {
+        if (extra.server == nullptr) { break; }
+        ProcessFrameFor(extra.server, *extra.id, false, false);
+      }
+      return;
+    }
+
+    if (destination == (config_.id & 0x7f)) {
+      ProcessFrameFor(server_, config_.id, true, true);
+      return;
+    }
+
+    for (auto& extra : extra_servers_) {
+      if (extra.server == nullptr) { break; }
+      if (destination == (*extra.id & 0x7f)) {
+        ProcessFrameFor(extra.server, *extra.id, false, true);
         return;
       }
     }
+
+    stats_.wrong_id++;
+  }
+
+  void ProcessFrameFor(Server* server, uint8_t id,
+                       bool tunnels, bool may_reply)
+      __attribute__ ((optimize("O3"))) {
+    active_server_ = server;
+    tunnels_active_ = tunnels;
 
     // Cap the response buffer view to the transport's advertised
     // maximum payload.  Without this, ProcessSubframeRead and the
@@ -235,10 +281,11 @@ class MicroServer::Impl {
       base::string_span(write_buffer_, effective_size)};
     BufferWriteStream write_stream{buffer_write_stream};
     const bool need_response =
+        may_reply &&
         ((read_header_.source) & 0x80) != 0 &&
         !write_outstanding_;
 
-    server_->StartFrame();
+    server->StartFrame();
 
     // Everything checked out.  Now we we can process our subframes.
     ProcessSubframes(
@@ -246,20 +293,22 @@ class MicroServer::Impl {
         &buffer_write_stream,
         need_response ? &write_stream : nullptr);
 
-    const auto action = server_->CompleteFrame();
+    const auto action = server->CompleteFrame();
 
     if (action == Server::kDiscard) {
       stats_.discards++;
     } else if (need_response && action == Server::kAccept) {
-      WriteResponse(read_header_.source & 0x7f, buffer_write_stream.offset());
+      WriteResponse(id, read_header_.source & 0x7f,
+                    buffer_write_stream.offset());
     }
   }
 
-  void WriteResponse(uint8_t client_id, std::streamsize response_size) {
+  void WriteResponse(uint8_t server_id, uint8_t client_id,
+                     std::streamsize response_size) {
     MJ_ASSERT(!write_outstanding_);
 
     write_header_.size = response_size;
-    write_header_.source = config_.id & 0x7f;
+    write_header_.source = server_id & 0x7f;
     write_header_.destination = client_id;
 
     write_outstanding_ = true;
@@ -304,6 +353,19 @@ class MicroServer::Impl {
       }
 
       const auto subframe_type = *maybe_subframe_type;
+
+      if (!tunnels_active_ &&
+          (subframe_type == u8(Subframe::kClientToServer) ||
+           subframe_type == u8(Subframe::kClientPollServer) ||
+           subframe_type == u8(Subframe::kClientPollServerFlow))) {
+        // Tunnels belong to the primary ID only.  Step over the
+        // subframe so any register subframes after it still apply.
+        if (SkipTunnelSubframe(subframe_type, buffer_stream, str)) {
+          stats_.malformed_subframe++;
+          return;
+        }
+        continue;
+      }
 
       if (subframe_type == u8(Subframe::kClientToServer)) {
         // The client sent us some data.
@@ -381,6 +443,32 @@ class MicroServer::Impl {
       stats_.unknown_subframe++;
       return;
     }
+  }
+
+  // @return true if malformed
+  bool SkipTunnelSubframe(uint32_t subframe_type,
+                          base::BufferReadStream& buffer_stream,
+                          BufferReadStream& str) {
+    const auto maybe_channel = str.ReadVaruint();
+    if (!maybe_channel) { return true; }
+
+    if (subframe_type == u8(Subframe::kClientToServer)) {
+      const auto maybe_bytes = str.ReadVaruint();
+      if (!maybe_bytes ||
+          buffer_stream.remaining() <
+          static_cast<std::streamsize>(*maybe_bytes)) {
+        return true;
+      }
+      str.base()->ignore(*maybe_bytes);
+      return false;
+    }
+
+    if (subframe_type == u8(Subframe::kClientPollServerFlow)) {
+      if (!str.ReadScalar<uint8_t>()) { return true; }
+    }
+
+    // Both poll subframes end with the maximum byte count.
+    return !str.ReadVaruint();
   }
 
   // @return true if malformed
@@ -628,7 +716,7 @@ class MicroServer::Impl {
       const auto maybe_value = ReadValue(type, str);
       if (!maybe_value) { return kMalformed; }
 
-      if (server_) {
+      if (active_server_) {
         // A response is emitted per error.  Stop emitting once the
         // response buffer no longer has worst-case headroom; we still
         // consume the remaining values from the request to keep the
@@ -637,7 +725,7 @@ class MicroServer::Impl {
             response && response_buffer_stream &&
             response_buffer_stream->remaining() < kResponseTailReserve;
         if (response_full) { stats_.response_buffer_full++; }
-        const auto write_action = server_->Write(current_register, *maybe_value);
+        const auto write_action = active_server_->Write(current_register, *maybe_value);
         switch (write_action) {
           case Server::kUnknownRegister: {
             if (!response_full) {
@@ -766,7 +854,8 @@ class MicroServer::Impl {
 
     for (size_t i = 0; i < *num_registers; i++) {
       const auto read_result =
-          server_ ? server_->Read(current_register, type) : uint32_t(1);
+          active_server_ ?
+          active_server_->Read(current_register, type) : uint32_t(1);
 
       if (read_result.index() == 0) {
         // We successfully read something.
@@ -800,6 +889,15 @@ class MicroServer::Impl {
   const MicroDatagramServer::Properties datagram_properties_;
   Server* server_ = nullptr;
 
+  struct ExtraServer {
+    const uint8_t* id = nullptr;
+    Server* server = nullptr;
+  };
+
+  // Valid only while a frame is being processed.
+  Server* active_server_ = nullptr;
+  bool tunnels_active_ = true;
+
   Config config_;
 
   MicroDatagramServer::Header read_header_;
@@ -813,6 +911,7 @@ class MicroServer::Impl {
   bool anything_to_do_ = false;
 
   micro::PoolArray<TunnelStream> tunnels_;
+  micro::PoolArray<ExtraServer> extra_servers_;
   Stats stats_;
 
   micro::AsyncWriter async_writer_;
@@ -832,6 +931,10 @@ micro::AsyncStream* MicroServer::MakeTunnel(uint32_t id) {
 
 void MicroServer::Start(Server* server) {
   impl_->Start(server);
+}
+
+void MicroServer::AddServer(const uint8_t* id, Server* server) {
+  impl_->AddServer(id, server);
 }
 
 void MicroServer::Poll() {

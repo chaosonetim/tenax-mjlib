@@ -1932,3 +1932,180 @@ BOOST_FIXTURE_TEST_CASE(ReceiveOverrunReinterpretsAsSubframes, Fixture) {
   // No spurious register write should be observed.
   BOOST_TEST(server.writes_.empty());
 }
+
+// Tenax Motion, 2026: tests for answering on several IDs.
+
+namespace {
+struct MultiFixture : test::PersistentConfigFixture {
+  micro::StreamPipe dut_stream{event_queue.MakePoster()};
+
+  Server server_a;
+  Server server_b;
+  Server server_c;
+  uint8_t id_b = 2;
+  uint8_t id_c = 5;
+
+  mjlib::multiplex::MicroStreamDatagram stream_datagram{
+    &pool, dut_stream.side_b(), {}};
+  MicroServer dut{&pool, &stream_datagram, []() {
+      MicroServer::Options options;
+      options.max_servers = 3;
+      return options;
+    }()};
+
+  micro::AsyncStream* tunnel{dut.MakeTunnel(9)};
+
+  char receive_buffer[256] = {};
+  int receive_count = 0;
+  ssize_t receive_size = 0;
+
+  MultiFixture() {
+    dut.Start(&server_a);
+    dut.AddServer(&id_b, &server_b);
+    dut.AddServer(&id_c, &server_c);
+  }
+
+  void Poll() {
+    event_queue.Poll();
+    dut.Poll();
+  }
+
+  void StartReceive() {
+    dut_stream.side_a()->AsyncReadSome(
+        receive_buffer, [&](micro::error_code ec, ssize_t size) {
+          BOOST_TEST(!ec);
+          receive_count++;
+          receive_size = size;
+        });
+  }
+
+  void Send(uint8_t destination, bool reply, const std::string& payload) {
+    Frame frame{0x00, reply, destination, payload};
+    const std::string encoded = frame.encode();
+    int write_count = 0;
+    AsyncWrite(*dut_stream.side_a(),
+               std::string_view(encoded.data(), encoded.size()),
+               [&](micro::error_code ec) {
+                 BOOST_TEST(!ec);
+                 write_count++;
+               });
+    Poll();
+    BOOST_TEST(write_count == 1);
+  }
+};
+
+// Write int8 register 2 = 0x20.
+const std::string kWriteReg2{"\x01\x02\x20", 3};
+// Read int8 register 0.
+const std::string kReadReg0{"\x11\x00", 2};
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdWriteGoesToOneServer, MultiFixture) {
+  Send(2, false, kWriteReg2);
+  BOOST_TEST(server_a.writes_.size() == 0);
+  BOOST_TEST(server_b.writes_.size() == 1);
+  BOOST_TEST(server_c.writes_.size() == 0);
+
+  Send(5, false, kWriteReg2);
+  BOOST_TEST(server_c.writes_.size() == 1);
+
+  Send(1, false, kWriteReg2);
+  BOOST_TEST(server_a.writes_.size() == 1);
+  BOOST_TEST(server_b.writes_.size() == 1);
+  BOOST_TEST(server_c.writes_.size() == 1);
+  BOOST_TEST(dut.stats()->wrong_id == 0u);
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdUnknownId, MultiFixture) {
+  Send(3, false, kWriteReg2);
+  BOOST_TEST(server_a.writes_.size() == 0);
+  BOOST_TEST(server_b.writes_.size() == 0);
+  BOOST_TEST(server_c.writes_.size() == 0);
+  BOOST_TEST(dut.stats()->wrong_id == 1u);
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdReplyComesFromThatId, MultiFixture) {
+  server_b.int8_values[0] = 7;
+
+  StartReceive();
+  Poll();
+  Send(2, true, kReadReg0);
+  BOOST_TEST(receive_count == 1);
+
+  Frame expected{0x02, false, 0x00, std::string{"\x21\x00\x07", 3}};
+  BOOST_TEST(std::string_view(receive_buffer, receive_size) ==
+             expected.encode());
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdIdIsReadEachFrame, MultiFixture) {
+  id_b = 9;
+  Send(2, false, kWriteReg2);
+  BOOST_TEST(server_b.writes_.size() == 0);
+  Send(9, false, kWriteReg2);
+  BOOST_TEST(server_b.writes_.size() == 1);
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdPrimaryWinsSameId, MultiFixture) {
+  id_b = 1;
+  Send(1, false, kWriteReg2);
+  BOOST_TEST(server_a.writes_.size() == 1);
+  BOOST_TEST(server_b.writes_.size() == 0);
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdBroadcastReachesAll, MultiFixture) {
+  StartReceive();
+  Poll();
+  server_a.next_write_error_ = MicroServer::Server::kUnknownRegister;
+  server_b.next_write_error_ = MicroServer::Server::kUnknownRegister;
+  Send(0x7f, true, kWriteReg2);
+  BOOST_TEST(server_a.writes_.size() == 1);
+  BOOST_TEST(server_b.writes_.size() == 1);
+  BOOST_TEST(server_c.writes_.size() == 1);
+
+  // Only the primary replies.
+  BOOST_TEST(receive_count == 1);
+  Frame expected{0x01, false, 0x00, std::string{"\x30\x02\x01", 3}};
+  BOOST_TEST(std::string_view(receive_buffer, receive_size) ==
+             expected.encode());
+
+  receive_count = 0;
+  StartReceive();
+  Poll();
+  BOOST_TEST(receive_count == 0);
+}
+
+BOOST_FIXTURE_TEST_CASE(MultiIdTunnelsOnlyOnPrimary, MultiFixture) {
+  char read_buffer[100] = {};
+  int read_count = 0;
+  tunnel->AsyncReadSome(read_buffer, [&](micro::error_code, ssize_t) {
+      read_count++;
+    });
+
+  // Tunnel data, a poll, a flow poll, then a register write.
+  std::string payload{"\x40\x09\x03" "abc", 6};
+  payload += std::string{"\x42\x09\x10", 3};
+  payload += std::string{"\x44\x09\x00\x10", 4};
+  payload += kWriteReg2;
+
+  StartReceive();
+  Poll();
+  Send(2, true, payload);
+  BOOST_TEST(read_count == 0);
+  BOOST_TEST(server_b.writes_.size() == 1);
+  BOOST_TEST(dut.stats()->malformed_subframe == 0u);
+  BOOST_TEST(dut.stats()->unknown_subframe == 0u);
+
+  // The reply holds no tunnel data, only an empty frame from ID 2.
+  BOOST_TEST(receive_count == 1);
+  Frame expected{0x02, false, 0x00, std::string{}};
+  BOOST_TEST(std::string_view(receive_buffer, receive_size) ==
+             expected.encode());
+
+  // The same frame to the primary ID feeds the tunnel.
+  receive_count = 0;
+  StartReceive();
+  Poll();
+  Send(1, true, payload);
+  BOOST_TEST(read_count == 1);
+  BOOST_TEST(server_a.writes_.size() == 1);
+}
